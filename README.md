@@ -1,5 +1,29 @@
 # Day 11 — Controlled Agent Security (2026)
 
+## Thông tin học viên
+
+| | |
+|---|---|
+| **Họ tên** | Nguyễn Văn Ba |
+| **MSSV** | 2A202603489 |
+| **Lớp** | K5 — L3A — Day 11 |
+
+### Cách chạy (từ gốc repo)
+
+```bash
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scriptsctivate
+pip install -r requirements.txt
+cp .env.example .env    # điền OPENROUTER_API_KEY (Blue) + OPENAI_API_KEY / GOOGLE_API_KEY (Red)
+
+python src/main.py --part 2   # CP2: test input/output guardrails
+python src/main.py --part 3   # CP3: Blue pipeline -> outputs/results.json, audit_log.json, metrics.json
+python src/main.py --part 4   # CP4: Red Team -> outputs/attack_results.json, ...
+pytest tests/smoke -q && pytest tests/public -q
+python scripts/grade.py --submission-dir . --out outputs/grade_report.json   # CP5
+```
+
+---
+
 > 👤 **Hình thức:** bài tập **cá nhân** (1 người / 1 MSSV).  
 > 🎯 **Mục tiêu:** đóng vai **Blue Team** để học cách xây Guardrails phòng thủ, rồi đóng vai **Red Team** để tấn công agent **Red** hoặc **Red Advance**.  
 > ✅ Làm theo **Checkpoint 1 → 5** trong [`CHECKPOINTS.md`](CHECKPOINTS.md) · nộp theo [`SUBMISSION.md`](SUBMISSION.md).
