@@ -37,29 +37,62 @@ def content_filter(response: str) -> dict:
         dict with 'safe', 'issues', and 'redacted' keys
     """
     issues = []
-    redacted = response
+    redacted = response or ""
 
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
-    }
-
+    # Thứ tự quan trọng: secret trước, rồi email, rồi số (SĐT trước CCCD).
     for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+        matches = re.findall(pattern, redacted, re.IGNORECASE)
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+
+    # Lớp cuối: secret bị che giấu (chèn dấu cách / ký tự, đảo ngược) mà regex
+    # trên không bắt được → không redact từng phần được, thay cả câu trả lời.
+    if _contains_obfuscated_secret(redacted):
+        issues.append("obfuscated_secret: 1 found")
+        redacted = SECRET_WITHHELD_MESSAGE
 
     return {
         "safe": len(issues) == 0,
         "issues": issues,
         "redacted": redacted,
     }
+
+
+PII_PATTERNS = {
+    "api_key": r"\bsk-[a-zA-Z0-9_-]{6,}",
+    "password": r"\b(?:password|passwd|pwd|mật\s*khẩu)\s*(?:is|là|[:=])\s*\S+",
+    "admin_password": r"\badmin123\b",
+    "internal_host": r"\b[\w.-]+\.internal(?::\d+)?\b",
+    "email": r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[a-zA-Z]{2,}",
+    # Di động 10 số (09x…) + cố định 11 số (02x…), cả dạng +84
+    "vn_phone": r"(?<!\d)(?:\+84|0)\d{9,10}(?!\d)",
+    "national_id": r"(?<!\d)(?:\d{12}|\d{9})(?!\d)",
+}
+
+SECRET_WITHHELD_MESSAGE = (
+    "[output_guardrail] Response withheld: it contained internal/confidential data. "
+    "How else can I help with your VinBank banking needs?"
+)
+
+
+def _squash(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+
+
+def _secret_needles() -> list[str]:
+    try:
+        from core.config import DEMO_SECRETS
+    except Exception:  # pragma: no cover
+        DEMO_SECRETS = []
+    needles = {_squash(s) for s in DEMO_SECRETS}
+    needles |= {"admin123", "skvinbanksecret2024", "dbvinbankinternal"}
+    return [n for n in needles if len(n) >= 6]
+
+
+def _contains_obfuscated_secret(text: str) -> bool:
+    squashed = _squash(text)
+    return any(n in squashed or n in squashed[::-1] for n in _secret_needles())
 
 
 # ============================================================
@@ -149,6 +182,8 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         self.blocked_count = 0
         self.redacted_count = 0
         self.total_count = 0
+        self.last_action: str | None = None  # None | "redacted" | "blocked"
+        self.last_issues: list[str] = []
 
     def _extract_text(self, llm_response) -> str:
         """Extract text from LLM response."""
@@ -172,16 +207,35 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        self.last_action = None
+        self.last_issues = []
 
-        return llm_response  # TODO: modify if needed
+        # 1. Regex filter: redact PII / secret
+        result = content_filter(response_text)
+        if not result["safe"]:
+            self.redacted_count += 1
+            self.last_issues = result["issues"]
+            self.last_action = "redacted"
+            if result["redacted"] == SECRET_WITHHELD_MESSAGE:
+                self.blocked_count += 1
+                self.last_action = "blocked"
+            llm_response.content = types.Content(
+                role="model", parts=[types.Part.from_text(text=result["redacted"])]
+            )
+            response_text = result["redacted"]
+
+        # 2. (Optional) LLM-as-Judge
+        if self.use_llm_judge:
+            verdict = await llm_safety_check(response_text)
+            if not verdict["safe"]:
+                self.blocked_count += 1
+                self.last_action = "blocked"
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[types.Part.from_text(text=SECRET_WITHHELD_MESSAGE)],
+                )
+
+        return llm_response
 
 
 # ============================================================

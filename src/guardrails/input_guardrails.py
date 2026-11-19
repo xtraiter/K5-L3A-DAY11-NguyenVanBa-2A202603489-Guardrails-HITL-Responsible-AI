@@ -11,6 +11,7 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -42,6 +43,42 @@ InputStatus = Literal["ALLOW", "BLOCK"]
 # Regex is one signal, not the whole security boundary.
 # ============================================================
 
+_INVISIBLE_CHARS = re.compile(
+    "[­͏؜ᅟᅠ឴឵᠎"
+    "​-‏‪-‮⁠-⁤⁦-⁯﻿]"
+)
+
+INJECTION_PATTERNS = [
+    # Override / bỏ qua chỉ dẫn
+    r"\b(ignore|disregard|forget|override|bypass)\s+(all\s+|any\s+|the\s+|your\s+)*"
+    r"(previous|prior|above|earlier|system|original)?\s*"
+    r"(instructions?|rules?|prompts?|directives?|guidelines?)",
+    # Đổi vai / persona
+    r"\byou\s+are\s+now\b",
+    r"\bpretend\s+(you\s+are|to\s+be)\b",
+    r"\bact\s+as\s+(a\s+|an\s+)?(unrestricted|unfiltered|jailbroken|evil|uncensored)",
+    r"\b(DAN|developer\s+mode|jailbreak(ed)?)\b",
+    # Moi system prompt / chỉ dẫn nội bộ
+    r"\bsystem\s+prompt\b",
+    r"\b(reveal|show|print|repeat|output|leak|display|tell\s+me)\s+(me\s+)?(your|the)\s+"
+    r"(hidden\s+|internal\s+|original\s+)?(instructions?|prompt|rules|config(uration)?)",
+    r"\b(reveal|disclose|leak|expose)\b.{0,40}\b(password|credentials?|api\s*key|secrets?)\b",
+    # Tiếng Việt
+    r"bỏ\s+qua\s+(mọi\s+|tất\s+cả\s+)?(các\s+)?(hướng\s+dẫn|chỉ\s+dẫn|quy\s+tắc)",
+    r"quên\s+(mọi\s+|tất\s+cả\s+)?(các\s+)?(hướng\s+dẫn|chỉ\s+dẫn|quy\s+tắc)",
+    r"tiết\s+lộ\s+(mật\s+khẩu|api|system\s*prompt|thông\s+tin\s+nội\s+bộ)",
+    r"\bbạn\s+bây\s+giờ\s+là\b",
+]
+_COMPILED_INJECTION = [re.compile(p, re.IGNORECASE) for p in INJECTION_PATTERNS]
+
+
+def normalize_text(text: str) -> str:
+    """NFKC + bỏ ký tự vô hình (zero-width, bidi) + gộp khoảng trắng."""
+    normalized = unicodedata.normalize("NFKC", text or "")
+    normalized = _INVISIBLE_CHARS.sub("", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
 def detect_injection(user_input: str) -> InputStatus:
     """Detect prompt injection patterns in user input.
 
@@ -51,14 +88,9 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
-    INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
-    ]
-
-    for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+    text = normalize_text(user_input)
+    for pattern in _COMPILED_INJECTION:
+        if pattern.search(text):
             return "BLOCK"
     return "ALLOW"
 
@@ -84,14 +116,33 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    text = _strip_accents(normalize_text(user_input).lower())
+    if not text:
+        return "BLOCK"
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    # 1. Topic cấm → chặn (match đầu từ: "kill" không dính "skill")
+    if any(re.search(rf"\b{re.escape(t)}", text) for t in BLOCKED_TOPICS):
+        return "BLOCK"
+    # 2. Không có tín hiệu banking nào → chặn (off-topic)
+    allowed = list(ALLOWED_TOPICS) + _EXTRA_ALLOWED_TOPICS
+    if not any(re.search(rf"\b{re.escape(_strip_accents(t))}", text) for t in allowed):
+        return "BLOCK"
+    # 3. Banking hợp lệ
+    return "ALLOW"
 
-    pass  # Replace with your implementation
+
+# Bổ sung vài từ khoá banking phổ biến ngoài config (EN + VI không dấu)
+_EXTRA_ALLOWED_TOPICS = [
+    "bank", "credit card", "debit card", "mortgage", "exchange rate",
+    "the ghi no", "khoan vay",
+]
+
+
+def _strip_accents(text: str) -> str:
+    """'tài khoản' → 'tai khoan' để khớp ALLOWED_TOPICS viết không dấu."""
+    text = text.replace("đ", "d").replace("Đ", "D")
+    decomposed = unicodedata.normalize("NFD", text)
+    return "".join(c for c in decomposed if unicodedata.category(c) != "Mn")
 
 
 # ============================================================
@@ -105,6 +156,21 @@ def topic_filter(user_input: str) -> InputStatus:
 #   - Return types.Content to block, or None to pass through
 # ============================================================
 
+MAX_INPUT_CHARS = 4000
+TOO_LONG_MESSAGE = (
+    f"[input_guardrail] Request blocked: message longer than {MAX_INPUT_CHARS} "
+    "characters. Please shorten your banking question."
+)
+INJECTION_BLOCK_MESSAGE = (
+    "[input_guardrail] Request blocked: possible prompt injection detected. "
+    "I can only help with VinBank banking questions."
+)
+TOPIC_BLOCK_MESSAGE = (
+    "[input_guardrail] Request blocked: off-topic. I'm a VinBank assistant and can "
+    "only help with banking questions (accounts, transfers, savings, loans, cards)."
+)
+
+
 class InputGuardrailPlugin(base_plugin.BasePlugin):
     """Plugin that blocks bad input before it reaches the LLM."""
 
@@ -112,6 +178,9 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         super().__init__(name="input_guardrail")
         self.blocked_count = 0
         self.total_count = 0
+        self.injection_blocked = 0
+        self.topic_blocked = 0
+        self.last_reason: str | None = None
 
     def _extract_text(self, content: types.Content) -> str:
         """Extract plain text from a Content object."""
@@ -144,14 +213,26 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        self.last_reason = None
 
-        pass  # Replace with your implementation
+        if len(text) > MAX_INPUT_CHARS:
+            self.blocked_count += 1
+            self.last_reason = "too_long"
+            return self._block_response(TOO_LONG_MESSAGE)
+
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            self.injection_blocked += 1
+            self.last_reason = "injection"
+            return self._block_response(INJECTION_BLOCK_MESSAGE)
+
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            self.topic_blocked += 1
+            self.last_reason = "topic"
+            return self._block_response(TOPIC_BLOCK_MESSAGE)
+
+        return None
 
 
 # ============================================================
